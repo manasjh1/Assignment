@@ -1,395 +1,524 @@
-# database.py - Hybrid solution that works with network issues
+# database.py - Production-ready Supabase PostgreSQL connection
 
-import httpx
-import json
+import os
 import uuid
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
-import os
+from typing import Optional, Dict, Any, List
+from contextlib import contextmanager
+
+from sqlalchemy import create_engine, Column, String, Boolean, DateTime, Text, JSON, Index
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from dotenv import load_dotenv
-import asyncio
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
+# Database Models
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = "users"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    email = Column(String, unique=True, nullable=False, index=True)
+    password_hash = Column(String, nullable=False)
+    phone_number = Column(String, unique=True, nullable=False, index=True)
+    first_name = Column(String)
+    last_name = Column(String)
+    role = Column(String, default="user")
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert user object to dictionary"""
+        return {
+            "id": self.id,
+            "email": self.email,
+            "phone_number": self.phone_number,
+            "first_name": self.first_name,
+            "last_name": self.last_name,
+            "role": self.role,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None
+        }
+
+class UserSession(Base):
+    __tablename__ = "user_sessions"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, nullable=False, index=True)
+    token_hash = Column(String, nullable=False, unique=True, index=True)
+    expires_at = Column(DateTime, nullable=False)
+    is_active = Column(Boolean, default=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert session object to dictionary"""
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "token_hash": self.token_hash,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat() if self.created_at else None
+        }
+
+class RegistrationOTP(Base):
+    __tablename__ = "registration_otps"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    phone_number = Column(String, nullable=False, index=True)
+    otp_code = Column(String, nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    registration_data = Column(JSON)
+    is_used = Column(Boolean, default=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class ForgotPasswordOTP(Base):
+    __tablename__ = "forgot_password_otps"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    phone_number = Column(String, nullable=False, index=True)
+    otp_code = Column(String, nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    is_used = Column(Boolean, default=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class DatabaseError(Exception):
+    """Custom database exception"""
+    pass
+
 class Database:
     def __init__(self):
-        self.supabase_url = os.getenv("SUPABASE_URL")
-        self.secret_key = "sb_secret_1F_dmPHSbYTkkb7DBNlAtQ_wO9g6AAG"
-        
-        self.headers = {
-            "apikey": self.secret_key,
-            "Authorization": f"Bearer {self.secret_key}",
-            "Content-Type": "application/json"
-        }
-        
-        # In-memory storage for when network fails
-        self.users = {}
-        self.sessions = {}
-        self.registration_otps = {}
-        self.forgot_password_otps = {}
-        
-        # Network status
-        self.network_available = True
-        
-        print(f"🔗 Database: Hybrid mode (Supabase API + Local fallback)")
-        
-        # Add sample data for testing
-        self._add_sample_data()
+        self.connection_string = self._get_connection_string()
+        self.engine = self._create_engine()
+        self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+        self._initialize_database()
+        logger.info("Database connection established successfully")
 
-    def _add_sample_data(self):
-        """Add sample data for immediate testing"""
-        sample_user = {
-            "id": str(uuid.uuid4()),
-            "email": "test@example.com",
-            "password_hash": "$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LeWWxBXXfBuSsHxNG",
-            "phone_number": "+911234567890",
-            "first_name": "Test",
-            "last_name": "User",
-            "role": "user",
-            "is_active": True,
-            "created_at": datetime.now().isoformat(),
-            "updated_at": datetime.now().isoformat()
-        }
-        self.users[sample_user["id"]] = sample_user
-        print(f"✅ Sample user available: {sample_user['email']} (password: password123)")
+    def _get_connection_string(self) -> str:
+        """Get database connection string from environment"""
+        connection_string = os.getenv("DATABASE_URL")
+        if not connection_string:
+            raise DatabaseError("DATABASE_URL environment variable is required")
+        return connection_string
 
-    async def _test_network(self) -> bool:
-        """Test if network connection is available"""
+    def _create_engine(self):
+        """Create SQLAlchemy engine with production settings"""
+        return create_engine(
+            self.connection_string,
+            echo=os.getenv("DEBUG", "false").lower() == "true",
+            pool_size=10,
+            max_overflow=20,
+            pool_pre_ping=True,
+            pool_recycle=3600,  # 1 hour
+            connect_args={
+                "sslmode": "require",
+                "connect_timeout": 30,
+                "application_name": "sarthi_backend"
+            },
+            execution_options={
+                "compiled_cache": {},
+                "isolation_level": "READ_COMMITTED"
+            }
+        )
+
+    def _initialize_database(self):
+        """Initialize database and create tables"""
         try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                response = await client.get("https://google.com")
-                return response.status_code == 200
-        except:
+            # Test connection
+            with self.engine.connect() as conn:
+                conn.execute("SELECT 1")
+            
+            # Create tables
+            Base.metadata.create_all(bind=self.engine)
+            logger.info("Database tables initialized")
+            
+            # Create sample data only in debug mode
+            if os.getenv("DEBUG", "false").lower() == "true":
+                self._create_sample_data()
+                
+        except Exception as e:
+            logger.error(f"Database initialization failed: {e}")
+            raise DatabaseError(f"Failed to initialize database: {e}")
+
+    def _create_sample_data(self):
+        """Create sample data for development/testing"""
+        try:
+            with self.get_session() as session:
+                existing_user = session.query(User).filter(User.email == "test@example.com").first()
+                if not existing_user:
+                    sample_user = User(
+                        email="test@example.com",
+                        password_hash="$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LeWWxBXXfBuSsHxNG",
+                        phone_number="+911234567890",
+                        first_name="Test",
+                        last_name="User",
+                        role="user",
+                        is_active=True
+                    )
+                    session.add(sample_user)
+                    session.commit()
+                    logger.info("Sample test user created for development")
+        except Exception as e:
+            logger.warning(f"Could not create sample data: {e}")
+
+    @contextmanager
+    def get_session(self):
+        """Context manager for database sessions"""
+        session = self.SessionLocal()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def check_connection(self) -> bool:
+        """Health check for database connection"""
+        try:
+            with self.engine.connect() as conn:
+                conn.execute("SELECT 1")
+                return True
+        except Exception as e:
+            logger.error(f"Database health check failed: {e}")
             return False
 
-    async def _make_request(self, method: str, endpoint: str, data: Optional[Dict] = None, params: Optional[Dict] = None) -> Optional[Dict]:
-        """Make HTTP request with fallback"""
-        if not self.network_available:
-            return None
-            
-        url = f"{self.supabase_url}/rest/v1/{endpoint}"
-        
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                if method == "GET":
-                    response = await client.get(url, headers=self.headers, params=params)
-                elif method == "POST":
-                    response = await client.post(url, headers=self.headers, json=data)
-                elif method == "PATCH":
-                    response = await client.patch(url, headers=self.headers, json=data, params=params)
-                elif method == "DELETE":
-                    response = await client.delete(url, headers=self.headers, params=params)
-                
-                if response.status_code in [200, 201]:
-                    return response.json()
-                else:
-                    print(f"API Error {response.status_code}: {response.text}")
-                    self.network_available = False
-                    return None
-                    
-        except Exception as e:
-            print(f"Network error, using local storage: {str(e)[:50]}")
-            self.network_available = False
-            return None
-
-    # User operations with hybrid storage
+    # User operations
     async def create_user(self, user_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Create user with hybrid storage"""
-        user_id = str(uuid.uuid4())
-        user_record = {
-            "id": user_id,
-            "email": user_data["email"],
-            "password_hash": user_data["password_hash"],
-            "phone_number": user_data["phone_number"],
-            "first_name": user_data.get("first_name"),
-            "last_name": user_data.get("last_name"),
-            "role": user_data.get("role", "user"),
-            "is_active": user_data.get("is_active", True),
-            "created_at": datetime.now().isoformat(),
-            "updated_at": datetime.now().isoformat()
-        }
-        
-        # Try Supabase first
-        result = await self._make_request("POST", "users", user_record)
-        
-        if result and len(result) > 0:
-            print(f"✅ User created in Supabase: {user_data['email']}")
-            return result[0]
-        else:
-            # Fallback to local storage
-            self.users[user_id] = user_record
-            print(f"✅ User created locally: {user_data['email']}")
-            return user_record
+        """Create a new user"""
+        try:
+            # Normalize email to lowercase before storage
+            normalized_email = user_data["email"].strip().lower()
+            
+            with self.get_session() as session:
+                user = User(
+                    email=normalized_email,
+                    password_hash=user_data["password_hash"],
+                    phone_number=user_data["phone_number"],
+                    first_name=user_data.get("first_name"),
+                    last_name=user_data.get("last_name"),
+                    role=user_data.get("role", "user"),
+                    is_active=user_data.get("is_active", True)
+                )
+                session.add(user)
+                session.flush()  # Get the ID without committing
+                result = user.to_dict()
+                logger.info(f"User created successfully: {normalized_email}")
+                return result
+                
+        except IntegrityError as e:
+            logger.error(f"User creation failed - duplicate entry: {e}")
+            raise DatabaseError("Email or phone number already exists")
+        except Exception as e:
+            logger.error(f"User creation failed: {e}")
+            raise DatabaseError(f"Failed to create user: {e}")
 
     async def get_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
-        """Get user by email with hybrid lookup"""
-        # Try Supabase first
-        result = await self._make_request("GET", "users", params={"email": f"eq.{email}"})
-        
-        if result and len(result) > 0:
-            return result[0]
-        
-        # Fallback to local storage
-        for user in self.users.values():
-            if user["email"] == email:
-                return user
-        return None
+        """Get user by email address"""
+        try:
+            # Normalize email to lowercase for case-insensitive lookup
+            normalized_email = email.strip().lower()
+            
+            with self.get_session() as session:
+                user = session.query(User).filter(User.email == normalized_email).first()
+                if user:
+                    result = user.to_dict()
+                    result["password_hash"] = user.password_hash  # Include for auth
+                    return result
+                return None
+        except Exception as e:
+            logger.error(f"Failed to get user by email: {e}")
+            raise DatabaseError(f"Database query failed: {e}")
 
     async def get_user_by_phone(self, phone_number: str) -> Optional[Dict[str, Any]]:
-        """Get user by phone with hybrid lookup"""
-        # Try Supabase first
-        result = await self._make_request("GET", "users", params={"phone_number": f"eq.{phone_number}"})
-        
-        if result and len(result) > 0:
-            return result[0]
-        
-        # Fallback to local storage
-        for user in self.users.values():
-            if user["phone_number"] == phone_number:
-                return user
-        return None
+        """Get user by phone number"""
+        try:
+            with self.get_session() as session:
+                user = session.query(User).filter(User.phone_number == phone_number).first()
+                if user:
+                    result = user.to_dict()
+                    result["password_hash"] = user.password_hash  # Include for auth
+                    return result
+                return None
+        except Exception as e:
+            logger.error(f"Failed to get user by phone: {e}")
+            raise DatabaseError(f"Database query failed: {e}")
 
     async def get_user_by_id(self, user_id: str) -> Optional[Dict[str, Any]]:
-        """Get user by ID with hybrid lookup"""
-        # Try Supabase first
-        result = await self._make_request("GET", "users", params={"id": f"eq.{user_id}"})
-        
-        if result and len(result) > 0:
-            return result[0]
-        
-        # Fallback to local storage
-        return self.users.get(user_id)
+        """Get user by ID"""
+        try:
+            with self.get_session() as session:
+                user = session.query(User).filter(User.id == user_id).first()
+                return user.to_dict() if user else None
+        except Exception as e:
+            logger.error(f"Failed to get user by ID: {e}")
+            raise DatabaseError(f"Database query failed: {e}")
+
+    async def update_user(self, user_id: str, update_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Update user information"""
+        try:
+            with self.get_session() as session:
+                user = session.query(User).filter(User.id == user_id).first()
+                if not user:
+                    return None
+                
+                for key, value in update_data.items():
+                    if hasattr(user, key) and key not in ['id', 'created_at']:
+                        setattr(user, key, value)
+                
+                user.updated_at = datetime.utcnow()
+                session.flush()
+                return user.to_dict()
+                
+        except IntegrityError as e:
+            logger.error(f"User update failed - duplicate entry: {e}")
+            raise DatabaseError("Email or phone number already exists")
+        except Exception as e:
+            logger.error(f"Failed to update user: {e}")
+            raise DatabaseError(f"Failed to update user: {e}")
 
     async def update_user_password_by_phone(self, phone_number: str, password_hash: str) -> bool:
-        """Update password with hybrid storage"""
-        update_data = {
-            "password_hash": password_hash,
-            "updated_at": datetime.now().isoformat()
-        }
-        
-        # Try Supabase first
-        result = await self._make_request("PATCH", "users", update_data, {"phone_number": f"eq.{phone_number}"})
-        
-        if result is not None:
-            print(f"✅ Password updated in Supabase: {phone_number}")
-            return True
-        else:
-            # Fallback to local storage
-            for user in self.users.values():
-                if user["phone_number"] == phone_number:
-                    user["password_hash"] = password_hash
-                    user["updated_at"] = datetime.now().isoformat()
-                    print(f"✅ Password updated locally: {phone_number}")
-                    return True
-            return False
+        """Update user password by phone number"""
+        try:
+            with self.get_session() as session:
+                user = session.query(User).filter(User.phone_number == phone_number).first()
+                if not user:
+                    return False
+                
+                user.password_hash = password_hash
+                user.updated_at = datetime.utcnow()
+                session.flush()
+                logger.info(f"Password updated for user: {phone_number}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to update password: {e}")
+            raise DatabaseError(f"Failed to update password: {e}")
 
     # Session operations
     async def create_session(self, session_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Create session with hybrid storage"""
-        session_id = str(uuid.uuid4())
-        session_record = {
-            "id": session_id,
-            **session_data,
-            "created_at": datetime.now().isoformat()
-        }
-        
-        # Try Supabase first
-        result = await self._make_request("POST", "user_sessions", session_record)
-        
-        if result and len(result) > 0:
-            return result[0]
-        else:
-            # Fallback to local storage
-            self.sessions[session_id] = session_record
-            return session_record
+        """Create new user session"""
+        try:
+            with self.get_session() as session:
+                session_obj = UserSession(
+                    user_id=session_data["user_id"],
+                    token_hash=session_data["token_hash"],
+                    expires_at=datetime.fromisoformat(session_data["expires_at"])
+                )
+                session.add(session_obj)
+                session.flush()
+                return session_obj.to_dict()
+                
+        except Exception as e:
+            logger.error(f"Failed to create session: {e}")
+            raise DatabaseError(f"Failed to create session: {e}")
 
-    async def get_session(self, token_hash: str) -> Optional[Dict[str, Any]]:
-        """Get session with hybrid lookup"""
-        # Try Supabase first
-        params = {
-            "token_hash": f"eq.{token_hash}",
-            "is_active": "eq.true"
-        }
-        result = await self._make_request("GET", "user_sessions", params=params)
-        
-        if result and len(result) > 0:
-            return result[0]
-        
-        # Fallback to local storage
-        for session in self.sessions.values():
-            if (session.get("token_hash") == token_hash and 
-                session.get("is_active", True)):
-                return session
-        return None
+    async def get_session_by_token(self, token_hash: str) -> Optional[Dict[str, Any]]:
+        """Get active session by token hash"""
+        try:
+            with self.get_session() as session:
+                session_obj = session.query(UserSession).filter(
+                    UserSession.token_hash == token_hash,
+                    UserSession.is_active == True,
+                    UserSession.expires_at > datetime.utcnow()
+                ).first()
+                
+                return session_obj.to_dict() if session_obj else None
+                
+        except Exception as e:
+            logger.error(f"Failed to get session: {e}")
+            raise DatabaseError(f"Failed to get session: {e}")
 
     async def invalidate_session(self, token_hash: str) -> bool:
-        """Invalidate session with hybrid storage"""
-        # Try Supabase first
-        update_data = {"is_active": False}
-        result = await self._make_request("PATCH", "user_sessions", update_data, {"token_hash": f"eq.{token_hash}"})
-        
-        if result is not None:
-            return True
-        else:
-            # Fallback to local storage
-            for session in self.sessions.values():
-                if session.get("token_hash") == token_hash:
-                    session["is_active"] = False
-                    return True
-            return False
+        """Invalidate a specific session"""
+        try:
+            with self.get_session() as session:
+                result = session.query(UserSession).filter(
+                    UserSession.token_hash == token_hash
+                ).update({"is_active": False})
+                return result > 0
+                
+        except Exception as e:
+            logger.error(f"Failed to invalidate session: {e}")
+            raise DatabaseError(f"Failed to invalidate session: {e}")
 
     async def invalidate_user_sessions(self, user_id: str) -> bool:
-        """Invalidate all user sessions with hybrid storage"""
-        # Try Supabase first
-        update_data = {"is_active": False}
-        result = await self._make_request("PATCH", "user_sessions", update_data, {"user_id": f"eq.{user_id}"})
-        
-        if result is not None:
-            return True
-        else:
-            # Fallback to local storage
-            for session in self.sessions.values():
-                if session.get("user_id") == user_id:
-                    session["is_active"] = False
-            return True
+        """Invalidate all sessions for a user"""
+        try:
+            with self.get_session() as session:
+                session.query(UserSession).filter(
+                    UserSession.user_id == user_id
+                ).update({"is_active": False})
+                logger.info(f"All sessions invalidated for user: {user_id}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to invalidate user sessions: {e}")
+            raise DatabaseError(f"Failed to invalidate user sessions: {e}")
 
-    # OTP operations with hybrid storage
-    async def store_registration_otp(self, phone_number: str, otp_code: str, expires_at: str, registration_data: Dict[str, Any]) -> str:
-        """Store registration OTP with hybrid storage"""
-        otp_id = str(uuid.uuid4())
-        otp_record = {
-            "id": otp_id,
-            "phone_number": phone_number,
-            "otp_code": otp_code,
-            "expires_at": expires_at,
-            "registration_data": registration_data,
-            "is_used": False,
-            "created_at": datetime.now().isoformat()
-        }
-        
-        # Try Supabase first - delete existing
-        await self._make_request("DELETE", "registration_otps", params={"phone_number": f"eq.{phone_number}"})
-        
-        # Try Supabase first - insert new
-        result = await self._make_request("POST", "registration_otps", otp_record)
-        
-        if result and len(result) > 0:
-            print(f"✅ Registration OTP stored in Supabase: {phone_number}")
-            return result[0]["id"]
-        else:
-            # Fallback to local storage
-            self.registration_otps[phone_number] = otp_record
-            print(f"✅ Registration OTP stored locally: {phone_number}")
-            return otp_id
+    async def cleanup_expired_sessions(self) -> int:
+        """Clean up expired sessions (utility method)"""
+        try:
+            with self.get_session() as session:
+                result = session.query(UserSession).filter(
+                    UserSession.expires_at < datetime.utcnow()
+                ).update({"is_active": False})
+                logger.info(f"Cleaned up {result} expired sessions")
+                return result
+                
+        except Exception as e:
+            logger.error(f"Failed to cleanup expired sessions: {e}")
+            return 0
+
+    # OTP operations
+    async def store_registration_otp(self, phone_number: str, otp_code: str, 
+                                   expires_at: str, registration_data: Dict[str, Any]) -> str:
+        """Store registration OTP"""
+        try:
+            with self.get_session() as session:
+                # Clean up existing OTPs for this phone
+                session.query(RegistrationOTP).filter(
+                    RegistrationOTP.phone_number == phone_number
+                ).delete()
+                
+                otp_obj = RegistrationOTP(
+                    phone_number=phone_number,
+                    otp_code=otp_code,
+                    expires_at=datetime.fromisoformat(expires_at),
+                    registration_data=registration_data
+                )
+                session.add(otp_obj)
+                session.flush()
+                logger.info(f"Registration OTP stored for: {phone_number}")
+                return otp_obj.id
+                
+        except Exception as e:
+            logger.error(f"Failed to store registration OTP: {e}")
+            raise DatabaseError(f"Failed to store registration OTP: {e}")
 
     async def verify_registration_otp(self, phone_number: str, otp_code: str) -> Optional[Dict[str, Any]]:
-        """Verify registration OTP with hybrid lookup"""
-        current_time = datetime.now().isoformat()
-        
-        # Try Supabase first
-        params = {
-            "phone_number": f"eq.{phone_number}",
-            "otp_code": f"eq.{otp_code}",
-            "is_used": "eq.false",
-            "expires_at": f"gt.{current_time}"
-        }
-        result = await self._make_request("GET", "registration_otps", params=params)
-        
-        if result and len(result) > 0:
-            # Mark as used in Supabase
-            update_data = {"is_used": True}
-            await self._make_request("PATCH", "registration_otps", update_data, 
-                                   {"phone_number": f"eq.{phone_number}", "otp_code": f"eq.{otp_code}"})
-            print(f"✅ Registration OTP verified in Supabase: {phone_number}")
-            return result[0]
-        
-        # Fallback to local storage
-        if phone_number in self.registration_otps:
-            otp_record = self.registration_otps[phone_number]
-            if (otp_record["otp_code"] == otp_code and 
-                not otp_record["is_used"] and
-                otp_record["expires_at"] > current_time):
-                otp_record["is_used"] = True
-                print(f"✅ Registration OTP verified locally: {phone_number}")
-                return otp_record
-        
-        print(f"❌ Registration OTP verification failed: {phone_number}")
-        return None
+        """Verify registration OTP"""
+        try:
+            with self.get_session() as session:
+                otp_obj = session.query(RegistrationOTP).filter(
+                    RegistrationOTP.phone_number == phone_number,
+                    RegistrationOTP.otp_code == otp_code,
+                    RegistrationOTP.is_used == False,
+                    RegistrationOTP.expires_at > datetime.utcnow()
+                ).first()
+                
+                if otp_obj:
+                    otp_obj.is_used = True
+                    session.flush()
+                    
+                    result = {
+                        "id": otp_obj.id,
+                        "phone_number": otp_obj.phone_number,
+                        "registration_data": otp_obj.registration_data,
+                        "created_at": otp_obj.created_at.isoformat()
+                    }
+                    logger.info(f"Registration OTP verified for: {phone_number}")
+                    return result
+                
+                logger.warning(f"Registration OTP verification failed for: {phone_number}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Failed to verify registration OTP: {e}")
+            raise DatabaseError(f"Failed to verify registration OTP: {e}")
 
     async def store_forgot_password_otp(self, phone_number: str, otp_code: str, expires_at: str) -> bool:
-        """Store forgot password OTP with hybrid storage"""
-        otp_record = {
-            "id": str(uuid.uuid4()),
-            "phone_number": phone_number,
-            "otp_code": otp_code,
-            "expires_at": expires_at,
-            "is_used": False,
-            "created_at": datetime.now().isoformat()
-        }
-        
-        # Try Supabase first
-        await self._make_request("DELETE", "forgot_password_otps", params={"phone_number": f"eq.{phone_number}"})
-        result = await self._make_request("POST", "forgot_password_otps", otp_record)
-        
-        if result and len(result) > 0:
-            print(f"✅ Password reset OTP stored in Supabase: {phone_number}")
-            return True
-        else:
-            # Fallback to local storage
-            self.forgot_password_otps[phone_number] = otp_record
-            print(f"✅ Password reset OTP stored locally: {phone_number}")
-            return True
+        """Store forgot password OTP"""
+        try:
+            with self.get_session() as session:
+                # Clean up existing OTPs for this phone
+                session.query(ForgotPasswordOTP).filter(
+                    ForgotPasswordOTP.phone_number == phone_number
+                ).delete()
+                
+                otp_obj = ForgotPasswordOTP(
+                    phone_number=phone_number,
+                    otp_code=otp_code,
+                    expires_at=datetime.fromisoformat(expires_at)
+                )
+                session.add(otp_obj)
+                session.flush()
+                logger.info(f"Forgot password OTP stored for: {phone_number}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Failed to store forgot password OTP: {e}")
+            raise DatabaseError(f"Failed to store forgot password OTP: {e}")
 
     async def verify_forgot_password_otp(self, phone_number: str, otp_code: str) -> bool:
-        """Verify forgot password OTP with hybrid lookup"""
-        current_time = datetime.now().isoformat()
-        
-        # Try Supabase first
-        params = {
-            "phone_number": f"eq.{phone_number}",
-            "otp_code": f"eq.{otp_code}",
-            "is_used": "eq.false",
-            "expires_at": f"gt.{current_time}"
-        }
-        result = await self._make_request("GET", "forgot_password_otps", params=params)
-        
-        if result and len(result) > 0:
-            # Mark as used in Supabase
-            update_data = {"is_used": True}
-            await self._make_request("PATCH", "forgot_password_otps", update_data,
-                                   {"phone_number": f"eq.{phone_number}", "otp_code": f"eq.{otp_code}"})
-            print(f"✅ Password reset OTP verified in Supabase: {phone_number}")
-            return True
-        
-        # Fallback to local storage
-        if phone_number in self.forgot_password_otps:
-            otp_record = self.forgot_password_otps[phone_number]
-            if (otp_record["otp_code"] == otp_code and 
-                not otp_record["is_used"] and
-                otp_record["expires_at"] > current_time):
-                otp_record["is_used"] = True
-                print(f"✅ Password reset OTP verified locally: {phone_number}")
-                return True
-        
-        print(f"❌ Password reset OTP verification failed: {phone_number}")
-        return False
+        """Verify forgot password OTP"""
+        try:
+            with self.get_session() as session:
+                otp_obj = session.query(ForgotPasswordOTP).filter(
+                    ForgotPasswordOTP.phone_number == phone_number,
+                    ForgotPasswordOTP.otp_code == otp_code,
+                    ForgotPasswordOTP.is_used == False,
+                    ForgotPasswordOTP.expires_at > datetime.utcnow()
+                ).first()
+                
+                if otp_obj:
+                    otp_obj.is_used = True
+                    session.flush()
+                    logger.info(f"Forgot password OTP verified for: {phone_number}")
+                    return True
+                
+                logger.warning(f"Forgot password OTP verification failed for: {phone_number}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Failed to verify forgot password OTP: {e}")
+            raise DatabaseError(f"Failed to verify forgot password OTP: {e}")
 
-    # Required method
-    async def update_user(self, user_id: str, update_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Update user with hybrid storage"""
-        update_data["updated_at"] = datetime.now().isoformat()
-        
-        # Try Supabase first
-        result = await self._make_request("PATCH", "users", update_data, {"id": f"eq.{user_id}"})
-        
-        if result and len(result) > 0:
-            return result[0]
-        else:
-            # Fallback to local storage
-            if user_id in self.users:
-                self.users[user_id].update(update_data)
-                return self.users[user_id]
-            return {"id": user_id, **update_data}
+    async def cleanup_expired_otps(self) -> Dict[str, int]:
+        """Clean up expired OTPs (utility method)"""
+        try:
+            with self.get_session() as session:
+                reg_otps = session.query(RegistrationOTP).filter(
+                    RegistrationOTP.expires_at < datetime.utcnow(),
+                    RegistrationOTP.is_used == False
+                ).count()
+                
+                pwd_otps = session.query(ForgotPasswordOTP).filter(
+                    ForgotPasswordOTP.expires_at < datetime.utcnow(),
+                    ForgotPasswordOTP.is_used == False
+                ).count()
+                
+                # Delete expired OTPs
+                session.query(RegistrationOTP).filter(
+                    RegistrationOTP.expires_at < datetime.utcnow()
+                ).delete()
+                
+                session.query(ForgotPasswordOTP).filter(
+                    ForgotPasswordOTP.expires_at < datetime.utcnow()
+                ).delete()
+                
+                result = {"registration_otps": reg_otps, "password_otps": pwd_otps}
+                logger.info(f"Cleaned up expired OTPs: {result}")
+                return result
+                
+        except Exception as e:
+            logger.error(f"Failed to cleanup expired OTPs: {e}")
+            return {"registration_otps": 0, "password_otps": 0}
 
 # Create database instance
-db = Database()
+try:
+    db = Database()
+except Exception as e:
+    logger.critical(f"Failed to initialize database: {e}")
+    raise

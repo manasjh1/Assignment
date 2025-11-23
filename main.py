@@ -1,110 +1,119 @@
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from models import (
-    RegisterRequest, LoginRequest, TokenResponse,
-    VerifyRegistrationOTPRequest, RegisterOTPResponse, RegisterCompleteResponse,
-    ForgotPasswordRequest, ResetPasswordRequest
-)
-from auth import (
-    start_registration, complete_registration, login_user, 
-    refresh_access_token, logout_user, verify_token,
-    start_forgot_password, reset_password_with_otp
-)
+# main.py - Complete FastAPI application
 
+import os
+import logging
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Import your modules
+try:
+    from database import db, DatabaseError
+    from routes import auth_router
+    logger.info("All modules imported successfully")
+except ImportError as e:
+    logger.error(f"Failed to import modules: {e}")
+    raise
+
+# Create FastAPI app
 app = FastAPI(
-    title="AI Content Explorer API",
-    description="Authentication with Phone OTP Verification",
+    title="Assignment Backend API",
+    description="Authentication and user management API",
     version="1.0.0"
 )
 
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:8080"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-security = HTTPBearer()
+# Custom exception handler for database errors
+@app.exception_handler(DatabaseError)
+async def database_exception_handler(request, exc):
+    logger.error(f"Database error: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"message": "Database operation failed", "success": False}
+    )
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
-    user = await verify_token(token)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    return user
+# Include routers
+app.include_router(auth_router)
 
-@app.post("/auth/register", response_model=RegisterOTPResponse)
-async def register_step1(request: RegisterRequest):
-    """Step 1: Start registration and send OTP to phone"""
+# Root endpoint
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "message": "Assignment Backend API",
+        "status": "running",
+        "version": "1.0.0"
+    }
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    """Application health check"""
     try:
-        result = await start_registration(request)
-        return result
+        # Check database connection
+        db_healthy = db.check_connection()
+        
+        return {
+            "status": "healthy" if db_healthy else "unhealthy",
+            "database": "connected" if db_healthy else "disconnected",
+            "timestamp": "2025-11-23T20:00:00Z"
+        }
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(status_code=503, detail="Service unavailable")
 
-@app.post("/auth/verify-registration", response_model=RegisterCompleteResponse)
-async def register_step2(request: VerifyRegistrationOTPRequest):
-    """Step 2: Verify OTP and create user account"""
-    try:
-        result = await complete_registration(request)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+# Startup event
+@app.on_event("startup")
+async def startup_event():
+    """Application startup"""
+    logger.info("Starting Assignment Backend API...")
+    
+    # Verify database connection
+    if db.check_connection():
+        logger.info("Database connection verified")
+    else:
+        logger.error("Database connection failed")
+        raise Exception("Cannot start application without database")
+    
+    logger.info("Application startup complete")
 
-
-@app.post("/auth/login", response_model=TokenResponse)
-async def login(request: LoginRequest):
-    """Login with email and password (no OTP needed)"""
-    try:
-        tokens = await login_user(request)
-        return tokens
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=str(e))
-
-
-@app.post("/auth/forgot-password")
-async def forgot_password_step1(request: ForgotPasswordRequest):
-    """Step 1: Send OTP to phone for password reset"""
-    try:
-        result = await start_forgot_password(request)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/auth/reset-password")
-async def forgot_password_step2(request: ResetPasswordRequest):
-    """Step 2: Reset password with OTP verification"""
-    try:
-        result = await reset_password_with_otp(request)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/auth/refresh", response_model=TokenResponse)
-async def refresh(refresh_token: str):
-    """Refresh access token using refresh token"""
-    try:
-        new_tokens = await refresh_access_token(refresh_token)
-        return new_tokens
-    except Exception as e:
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
-
-@app.post("/auth/logout")
-async def logout(
-    current_user = Depends(get_current_user),
-    credentials: HTTPAuthorizationCredentials = Depends(security)
-):
-    """Logout user and invalidate session"""
-    try:
-        token = credentials.credentials
-        await logout_user(current_user["id"], token)
-        return {"message": "Logged out successfully"}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
+# Shutdown event
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Application shutdown"""
+    logger.info("Shutting down Assignment Backend API...")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    
+    # Get configuration from environment
+    host = os.getenv("HOST", "127.0.0.1")
+    port = int(os.getenv("PORT", "8000"))
+    debug = os.getenv("DEBUG", "false").lower() == "true"
+    
+    uvicorn.run(
+        "main:app",
+        host=host,
+        port=port,
+        reload=debug,
+        access_log=True
+    )

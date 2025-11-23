@@ -8,6 +8,9 @@ class RegisterRequest(BaseModel):
     phone_number: str  
     first_name: Optional[str] = None
     last_name: Optional[str] = None
+    role: str = "user"
+    is_active: bool = True
+    created_at: Optional[str] = None
 
 # Verify registration OTP 
 class VerifyRegistrationOTPRequest(BaseModel):
