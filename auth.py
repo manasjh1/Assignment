@@ -3,14 +3,14 @@ from datetime import datetime, timedelta
 import os
 import jwt
 import hashlib
-from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from fastapi import HTTPException, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from passlib.context import CryptContext
 import logging
+# UPDATE: Renamed RegisterRequest to RegistrationRequest in the import below
 from models import (
-    RegisterRequest, LoginRequest, TokenResponse, 
+    RegistrationRequest, LoginRequest, TokenResponse, 
     RegisterOTPResponse, RegisterCompleteResponse,
     ForgotPasswordRequest, ResetPasswordRequest,
     VerifyRegistrationOTPRequest, User
@@ -168,8 +168,6 @@ auth_manager = AuthManager(secret_key=os.getenv("JWT_SECRET_KEY", "your-default-
 def get_auth_manager() -> AuthManager:
     """Dependency to get auth manager"""
     return auth_manager
-
-# Just add this AuthService class to your existing auth.py file:
 
 class AuthService:
     @staticmethod

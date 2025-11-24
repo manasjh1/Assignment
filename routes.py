@@ -6,12 +6,19 @@ import random
 import string
 import json
 import logging
-from typing import Optional , List
+from typing import Optional, List
 from auth import AuthService
 from database import db, DatabaseError
 from auth import AuthManager, get_auth_manager
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from search_service import search_service
+from image_service import image_service
+from models import (
+    RegistrationRequest, OTPVerificationRequest, LoginRequest, 
+    ForgotPasswordRequest, ResetPasswordRequest, AuthResponse, 
+    MessageResponse, SearchRequest, SearchResult, SearchResponse,
+    ImageGenRequest, ImageGenResponse
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,91 +38,6 @@ async def get_current_user(
 # Create router
 auth_router = APIRouter(prefix="/auth", tags=["authentication"])
 
-# Pydantic models
-class RegistrationRequest(BaseModel):
-    email: EmailStr
-    password: str
-    phone_number: str
-    first_name: str
-    last_name: str
-
-    @validator('password')
-    def validate_password(cls, v):
-        if len(v) < 8:
-            raise ValueError('Password must be at least 8 characters long')
-        if not any(c.isupper() for c in v):
-            raise ValueError('Password must contain at least one uppercase letter')
-        if not any(c.islower() for c in v):
-            raise ValueError('Password must contain at least one lowercase letter')
-        if not any(c.isdigit() for c in v):
-            raise ValueError('Password must contain at least one digit')
-        return v
-
-    @validator('phone_number')
-    def validate_phone(cls, v):
-        # Remove all non-digit characters except +
-        clean_phone = ''.join(c for c in v if c.isdigit() or c == '+')
-        
-        # Check if it's a valid format
-        if clean_phone.startswith('+91') and len(clean_phone) == 13:
-            return clean_phone
-        elif len(clean_phone) == 10 and clean_phone.isdigit():
-            return '+91' + clean_phone
-        else:
-            raise ValueError('Invalid phone number format')
-
-class OTPVerificationRequest(BaseModel):
-    phone_number: str
-    otp_code: str
-
-class LoginRequest(BaseModel):
-    email: EmailStr
-    password: str
-
-class ForgotPasswordRequest(BaseModel):
-    phone_number: str
-
-class ResetPasswordRequest(BaseModel):
-    phone_number: str
-    otp_code: str
-    new_password: str
-
-    @validator('new_password')
-    def validate_password(cls, v):
-        if len(v) < 8:
-            raise ValueError('Password must be at least 8 characters long')
-        return v
-
-# Response models
-class AuthResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    user: dict
-    refresh_token: Optional[str] = None
-
-class MessageResponse(BaseModel):
-    message: str
-    success: bool = True
-
-class SearchRequest(BaseModel):
-    query: str = Field(..., min_length=1, max_length=500, description="Search query")
-    max_results: Optional[int] = Field(10, ge=1, le=50, description="Maximum results")
-    
-class SearchResult(BaseModel):
-    title: str
-    snippet: str
-    url: str
-    source: str
-    
-class SearchResponse(BaseModel):
-    results: List[SearchResult]
-    query: str
-    total_results: int
-    status: str
-    search_engine: str
-    protocol: str
-    error: Optional[str] = None
-        
 # Utility functions
 def generate_otp() -> str:
     """Generate 6-digit OTP"""
@@ -272,7 +194,6 @@ async def verify_registration(
         logger.error(f"Registration verification failed: {e}")
         raise HTTPException(status_code=500, detail="Verification failed")
 
-# FIXED LOGIN ROUTE
 @auth_router.post("/login")
 async def login_user(
     request: LoginRequest,
@@ -284,7 +205,7 @@ async def login_user(
     if not user_dict:
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
-    # 2. Verify password (using auth manager for consistency)
+    # 2. Verify password
     if not auth.verify_password(request.password, user_dict["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
@@ -299,7 +220,7 @@ async def login_user(
     # 4. Create Refresh Token
     refresh_token = AuthService.create_refresh_token(user_dict["id"])
     
-    # 5. Create Session in Database (Required for get_current_user)
+    # 5. Create Session in Database
     token_hash = auth.create_token_hash(access_token)
     expires_at = (datetime.utcnow() + timedelta(minutes=auth.access_token_expire_minutes)).isoformat()
     
@@ -398,8 +319,6 @@ async def logout_user(
 ):
     """Logout user and invalidate session"""
     try:
-        # This would require getting the token from the request
-        # For now, invalidate all user sessions
         await db.invalidate_user_sessions(current_user['id'])
         
         return MessageResponse(
@@ -416,12 +335,10 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
     """Get current user information"""
     return current_user
 
-# Health check
 @auth_router.get("/health")
 async def auth_health_check():
     """Authentication service health check"""
     try:
-        # Test database connection
         if db.check_connection():
             return {"status": "healthy", "service": "authentication"}
         else:
@@ -484,19 +401,17 @@ async def refresh_token(
 @router.post("/search", response_model=SearchResponse)
 async def search_web(
     request: SearchRequest,
-    current_user: dict = Depends(get_current_user)  # Require authentication
+    current_user: dict = Depends(get_current_user)
 ):
     """Search using DuckDuckGo MCP server - Protected endpoint"""
     try:
         logger.info(f"Search request from user {current_user.get('email')}: {request.query}")
         
-        # Perform the search
         search_result = await search_service.search(
             query=request.query,
             max_results=request.max_results
         )
         
-        # Convert results to response models
         results = [SearchResult(**result) for result in search_result["results"]]
         
         logger.info(f"Search completed for user {current_user.get('email')}: {len(results)} results")
@@ -521,15 +436,13 @@ async def admin_search_web(
     current_user: dict = Depends(get_current_user)
 ):
     """Admin search endpoint with elevated privileges"""
-    # Check if user has admin role
     if current_user.get('role') != 'admin':
         raise HTTPException(status_code=403, detail="Admin access required")
     
     try:
         logger.info(f"Admin search request from {current_user.get('email')}: {request.query}")
         
-        # Allow higher max_results for admin users
-        admin_max_results = min(request.max_results, 50)  # Admin can get up to 50 results
+        admin_max_results = min(request.max_results, 50)
         
         search_result = await search_service.search(
             query=request.query,
@@ -554,7 +467,7 @@ async def admin_search_web(
 
 @router.get("/search/history")
 async def get_search_history(current_user: dict = Depends(get_current_user)):
-    """Get user's search history - placeholder for future implementation"""
+    """Get user's search history"""
     return {
         "message": "Search history feature coming soon",
         "user_id": current_user.get('id'),
@@ -570,3 +483,25 @@ async def test_protected_endpoint(current_user: dict = Depends(get_current_user)
         "role": current_user.get('role'),
         "user_id": current_user.get('id')
     }
+
+@router.post("/image/generate", response_model=ImageGenResponse)
+async def generate_image(
+    request: ImageGenRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Generate image using Flux MCP - Protected endpoint"""
+    try:
+        logger.info(f"Image generation request from {current_user.get('email')}: {request.prompt}")
+        
+        result = await image_service.generate_image(
+            prompt=request.prompt,
+            model=request.model,
+            width=request.width,
+            height=request.height
+        )
+        
+        return ImageGenResponse(**result)
+        
+    except Exception as e:
+        logger.error(f"Image generation API error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Image generation error: {str(e)}")
