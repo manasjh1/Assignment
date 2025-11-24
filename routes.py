@@ -91,6 +91,7 @@ class AuthResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: dict
+    refresh_token: Optional[str] = None
 
 class MessageResponse(BaseModel):
     message: str
@@ -271,18 +272,42 @@ async def verify_registration(
         logger.error(f"Registration verification failed: {e}")
         raise HTTPException(status_code=500, detail="Verification failed")
 
-# Replace your login route with this:
+# FIXED LOGIN ROUTE
 @auth_router.post("/login")
-async def login_user(request: LoginRequest):
+async def login_user(
+    request: LoginRequest,
+    auth: AuthManager = Depends(get_auth_manager)
+):
+    """Login user and create session"""
+    # 1. Get user
     user_dict = await db.get_user_by_email(request.email)
     if not user_dict:
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
-    if not AuthService.verify_password(request.password, user_dict["password_hash"]):
+    # 2. Verify password (using auth manager for consistency)
+    if not auth.verify_password(request.password, user_dict["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
-    access_token = AuthService.create_access_token(user_dict["id"], user_dict["role"])
+    # 3. Create Access Token
+    token_data = {
+        "user_id": user_dict['id'],
+        "email": user_dict['email'],
+        "role": user_dict['role']
+    }
+    access_token = auth.create_access_token(token_data)
+    
+    # 4. Create Refresh Token
     refresh_token = AuthService.create_refresh_token(user_dict["id"])
+    
+    # 5. Create Session in Database (Required for get_current_user)
+    token_hash = auth.create_token_hash(access_token)
+    expires_at = (datetime.utcnow() + timedelta(minutes=auth.access_token_expire_minutes)).isoformat()
+    
+    await db.create_session({
+        "user_id": user_dict['id'],
+        "token_hash": token_hash,
+        "expires_at": expires_at
+    })
     
     return {
         "access_token": access_token,
@@ -455,18 +480,60 @@ async def refresh_token(
     except Exception as e:
         logger.error(f"Token refresh failed: {e}")
         raise HTTPException(status_code=500, detail="Token refresh failed")
-    
-# QUICK FIX - Update your search endpoint in routes.py to remove auth for testing
 
-@router.post("/search")
-async def search_web(request: SearchRequest):
-    """Search using DuckDuckGo MCP server - NO AUTH FOR TESTING"""
+@router.post("/search", response_model=SearchResponse)
+async def search_web(
+    request: SearchRequest,
+    current_user: dict = Depends(get_current_user)  # Require authentication
+):
+    """Search using DuckDuckGo MCP server - Protected endpoint"""
     try:
-        logger.info(f"Search request: {request.query}")
+        logger.info(f"Search request from user {current_user.get('email')}: {request.query}")
         
+        # Perform the search
         search_result = await search_service.search(
             query=request.query,
             max_results=request.max_results
+        )
+        
+        # Convert results to response models
+        results = [SearchResult(**result) for result in search_result["results"]]
+        
+        logger.info(f"Search completed for user {current_user.get('email')}: {len(results)} results")
+        
+        return SearchResponse(
+            results=results,
+            query=search_result["query"],
+            total_results=search_result["total_results"],
+            status=search_result["status"],
+            search_engine=search_result["search_engine"],
+            protocol=search_result["protocol"],
+            error=search_result.get("error")
+        )
+        
+    except Exception as e:
+        logger.error(f"Search API error for user {current_user.get('email')}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Search error: {str(e)}")
+
+@router.post("/admin/search", response_model=SearchResponse)
+async def admin_search_web(
+    request: SearchRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Admin search endpoint with elevated privileges"""
+    # Check if user has admin role
+    if current_user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    try:
+        logger.info(f"Admin search request from {current_user.get('email')}: {request.query}")
+        
+        # Allow higher max_results for admin users
+        admin_max_results = min(request.max_results, 50)  # Admin can get up to 50 results
+        
+        search_result = await search_service.search(
+            query=request.query,
+            max_results=admin_max_results
         )
         
         results = [SearchResult(**result) for result in search_result["results"]]
@@ -482,5 +549,24 @@ async def search_web(request: SearchRequest):
         )
         
     except Exception as e:
-        logger.error(f"Search API error: {str(e)}")
+        logger.error(f"Admin search error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Search error: {str(e)}")
+
+@router.get("/search/history")
+async def get_search_history(current_user: dict = Depends(get_current_user)):
+    """Get user's search history - placeholder for future implementation"""
+    return {
+        "message": "Search history feature coming soon",
+        "user_id": current_user.get('id'),
+        "searches": []
+    }
+
+@router.get("/test/protected")
+async def test_protected_endpoint(current_user: dict = Depends(get_current_user)):
+    """Test endpoint to verify authentication is working"""
+    return {
+        "message": "Authentication working!",
+        "user": current_user.get('email'),
+        "role": current_user.get('role'),
+        "user_id": current_user.get('id')
+    }
