@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
+from routes import router
 
 # Load environment variables
 load_dotenv()
@@ -51,10 +52,10 @@ async def database_exception_handler(request, exc):
         content={"message": "Database operation failed", "success": False}
     )
 
-# Include routers
+
+app.include_router(router)
 app.include_router(auth_router)
 
-# Root endpoint
 @app.get("/")
 async def root():
     """Root endpoint"""

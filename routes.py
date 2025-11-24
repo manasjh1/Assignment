@@ -1,18 +1,21 @@
 import os
-from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel, EmailStr, validator
+from fastapi import APIRouter, HTTPException, Depends, status
+from pydantic import BaseModel, EmailStr, Field, validator
 from datetime import datetime, timedelta
 import random
 import string
 import json
 import logging
-from typing import Optional
+from typing import Optional , List
 from auth import AuthService
 from database import db, DatabaseError
 from auth import AuthManager, get_auth_manager
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from search_service import search_service
 
 logger = logging.getLogger(__name__)
+
+router = APIRouter()
 
 # Security
 security = HTTPBearer()
@@ -93,6 +96,25 @@ class MessageResponse(BaseModel):
     message: str
     success: bool = True
 
+class SearchRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=500, description="Search query")
+    max_results: Optional[int] = Field(10, ge=1, le=50, description="Maximum results")
+    
+class SearchResult(BaseModel):
+    title: str
+    snippet: str
+    url: str
+    source: str
+    
+class SearchResponse(BaseModel):
+    results: List[SearchResult]
+    query: str
+    total_results: int
+    status: str
+    search_engine: str
+    protocol: str
+    error: Optional[str] = None
+        
 # Utility functions
 def generate_otp() -> str:
     """Generate 6-digit OTP"""
@@ -433,3 +455,32 @@ async def refresh_token(
     except Exception as e:
         logger.error(f"Token refresh failed: {e}")
         raise HTTPException(status_code=500, detail="Token refresh failed")
+    
+# QUICK FIX - Update your search endpoint in routes.py to remove auth for testing
+
+@router.post("/search")
+async def search_web(request: SearchRequest):
+    """Search using DuckDuckGo MCP server - NO AUTH FOR TESTING"""
+    try:
+        logger.info(f"Search request: {request.query}")
+        
+        search_result = await search_service.search(
+            query=request.query,
+            max_results=request.max_results
+        )
+        
+        results = [SearchResult(**result) for result in search_result["results"]]
+        
+        return SearchResponse(
+            results=results,
+            query=search_result["query"],
+            total_results=search_result["total_results"],
+            status=search_result["status"],
+            search_engine=search_result["search_engine"],
+            protocol=search_result["protocol"],
+            error=search_result.get("error")
+        )
+        
+    except Exception as e:
+        logger.error(f"Search API error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Search error: {str(e)}")
