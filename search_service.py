@@ -118,8 +118,8 @@ class DuckDuckGoMCPService:
             logger.info("Waiting for search results...")
             time.sleep(5)  # Wait longer for search to complete
             
-            # Now close stdin
-            process.stdin.close()
+            # FIXED: Removed process.stdin.close() here because communicate() handles it
+            # and calling it manually causes "I/O operation on closed file" error
             
             # Read all available output
             try:
