@@ -37,7 +37,11 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8080"],  
+    allow_origins=[
+        "http://localhost:8080",
+        "https://assignment-react-sigma.vercel.app",
+        "https://assignment-react-sigma.vercel.app/"
+        ],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
