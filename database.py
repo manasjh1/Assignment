@@ -1,11 +1,9 @@
-# database.py - Production-ready Supabase PostgreSQL connection
-
 import os
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from contextlib import contextmanager
-
+from sqlalchemy import cast, String, or_, and_
 from sqlalchemy import create_engine, Column, String, Boolean, DateTime, Text, JSON, Index, Integer
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
@@ -39,7 +37,7 @@ class User(Base):
     def to_dict(self) -> Dict[str, Any]:
         """Convert user object to dictionary"""
         return {
-            "id": self.id,
+            "id": str(self.id),  # Cast to string
             "email": self.email,
             "phone_number": self.phone_number,
             "first_name": self.first_name,
@@ -63,8 +61,8 @@ class UserSession(Base):
     def to_dict(self) -> Dict[str, Any]:
         """Convert session object to dictionary"""
         return {
-            "id": self.id,
-            "user_id": self.user_id,
+            "id": str(self.id),  # Cast to string
+            "user_id": str(self.user_id),  # Cast to string
             "token_hash": self.token_hash,
             "expires_at": self.expires_at.isoformat() if self.expires_at else None,
             "is_active": self.is_active,
@@ -99,19 +97,22 @@ class SearchHistory(Base):
     user_id = Column(String, nullable=False, index=True)
     query = Column(String, nullable=False)
     results = Column(JSON)
-    total_results = Column(Integer, default=0)
-    search_engine = Column(String, default="DuckDuckGo")
+    # FIX: Mapped to 'result_count' in DB
+    result_count = Column(Integer, default=0)
+    # FIX: Mapped to 'search_metadata' in DB (stores search_engine)
+    search_metadata = Column(JSON, default={})
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert search history object to dictionary"""
+        metadata = self.search_metadata or {}
         return {
-            "id": self.id,
-            "user_id": self.user_id,
+            "id": str(self.id),  # Cast to string
+            "user_id": str(self.user_id),  # Cast to string
             "query": self.query,
             "results": self.results,
-            "total_results": self.total_results,
-            "search_engine": self.search_engine,
+            "total_results": self.result_count,  # Map DB result_count -> API total_results
+            "search_engine": metadata.get("search_engine", "DuckDuckGo"),
             "created_at": self.created_at.isoformat() if self.created_at else None
         }
 
@@ -122,23 +123,22 @@ class ImageHistory(Base):
     user_id = Column(String, nullable=False, index=True)
     prompt = Column(Text, nullable=False)
     image_url = Column(Text, nullable=False)
-    model = Column(String, default="flux")
-    width = Column(Integer, default=1024)
-    height = Column(Integer, default=1024)
-    provider = Column(String, default="Flux")
+    # FIX: Mapped to 'generation_metadata' in DB (stores model, width, height, provider)
+    generation_metadata = Column(JSON, default={})
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert image history object to dictionary"""
+        meta = self.generation_metadata or {}
         return {
-            "id": self.id,
-            "user_id": self.user_id,
+            "id": str(self.id),  # Cast to string
+            "user_id": str(self.user_id),  # Cast to string
             "prompt": self.prompt,
             "image_url": self.image_url,
-            "model": self.model,
-            "width": self.width,
-            "height": self.height,
-            "provider": self.provider,
+            "model": meta.get("model", "flux"),
+            "width": meta.get("width", 1024),
+            "height": meta.get("height", 1024),
+            "provider": meta.get("provider", "Flux"),
             "created_at": self.created_at.isoformat() if self.created_at else None
         }
 
@@ -451,7 +451,7 @@ class Database:
                 session.add(otp_obj)
                 session.flush()
                 logger.info(f"Registration OTP stored for: {phone_number}")
-                return otp_obj.id
+                return str(otp_obj.id)
                 
         except Exception as e:
             logger.error(f"Failed to store registration OTP: {e}")
@@ -473,7 +473,7 @@ class Database:
                     session.flush()
                     
                     result = {
-                        "id": otp_obj.id,
+                        "id": str(otp_obj.id),
                         "phone_number": otp_obj.phone_number,
                         "registration_data": otp_obj.registration_data,
                         "created_at": otp_obj.created_at.isoformat()
@@ -571,50 +571,79 @@ class Database:
         """Save search to history"""
         try:
             with self.get_session() as session:
+                # FIX: Map total_results to result_count and search_engine to search_metadata
                 search_history = SearchHistory(
                     user_id=search_data["user_id"],
                     query=search_data["query"],
                     results=search_data["results"],
-                    total_results=search_data.get("total_results", 0),
-                    search_engine=search_data.get("search_engine", "DuckDuckGo")
+                    result_count=search_data.get("total_results", 0),
+                    search_metadata={"search_engine": search_data.get("search_engine", "DuckDuckGo")}
                 )
                 session.add(search_history)
                 session.flush()
                 logger.info(f"Search history saved for user: {search_data['user_id']}")
-                return search_history.id
+                return str(search_history.id)
                 
         except Exception as e:
             logger.error(f"Failed to save search history: {e}")
             raise DatabaseError(f"Failed to save search history: {e}")
 
-    async def get_search_history(self, user_id: str, page: int = 1, limit: int = 20) -> Dict[str, Any]:
-        """Get user's search history with pagination"""
+    async def get_search_history(
+        self, 
+        user_id: str, 
+        page: int = 1, 
+        limit: int = 20,
+        keyword: Optional[str] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        search_engine: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Get search history with filtering and pagination"""
         try:
             offset = (page - 1) * limit
             
             with self.get_session() as session:
-                # Get total count
-                total = session.query(SearchHistory).filter(
-                    SearchHistory.user_id == user_id
-                ).count()
+                # 1. Start with base query
+                query = session.query(SearchHistory).filter(SearchHistory.user_id == user_id)
                 
-                # Get paginated results
-                searches = session.query(SearchHistory).filter(
-                    SearchHistory.user_id == user_id
-                ).order_by(SearchHistory.created_at.desc()).offset(offset).limit(limit).all()
+                # 2. Apply Filters
+                if keyword:
+                    # Case-insensitive search on the query text
+                    query = query.filter(SearchHistory.query.ilike(f"%{keyword}%"))
+                
+                if start_date:
+                    query = query.filter(SearchHistory.created_at >= start_date)
+                
+                if end_date:
+                    # Set time to end of day if only date is provided
+                    query = query.filter(SearchHistory.created_at <= end_date)
+
+                if search_engine:
+                    # Filter inside the JSONB metadata column
+                    # Note: precise syntax depends on SQL dialect, this works for Postgres+SQLAlchemy
+                    query = query.filter(
+                        cast(SearchHistory.search_metadata['search_engine'], String) == f'"{search_engine}"'
+                    )
+
+                # 3. Get Total Count (after filtering, before pagination)
+                total = query.count()
+                
+                # 4. Apply Pagination and Fetch
+                searches = query.order_by(
+                    SearchHistory.created_at.desc()
+                ).offset(offset).limit(limit).all()
                 
                 return {
                     "searches": [search.to_dict() for search in searches],
                     "total": total,
                     "page": page,
                     "limit": limit,
-                    "total_pages": (total + limit - 1) // limit
+                    "total_pages": (total + limit - 1) // limit if limit > 0 else 0
                 }
                 
         except Exception as e:
             logger.error(f"Failed to get search history: {e}")
             raise DatabaseError(f"Failed to get search history: {e}")
-
     async def get_search_by_id(self, search_id: str, user_id: str) -> Optional[Dict[str, Any]]:
         """Get specific search by ID"""
         try:
@@ -651,52 +680,80 @@ class Database:
         """Save generated image to history"""
         try:
             with self.get_session() as session:
+                # FIX: Map model, width, height, provider to generation_metadata
+                meta = {
+                    "model": image_data.get("model", "flux"),
+                    "width": image_data.get("width", 1024),
+                    "height": image_data.get("height", 1024),
+                    "provider": image_data.get("provider", "Flux")
+                }
+                
                 image_history = ImageHistory(
                     user_id=image_data["user_id"],
                     prompt=image_data["prompt"],
                     image_url=image_data["image_url"],
-                    model=image_data.get("model", "flux"),
-                    width=image_data.get("width", 1024),
-                    height=image_data.get("height", 1024),
-                    provider=image_data.get("provider", "Flux")
+                    generation_metadata=meta
                 )
                 session.add(image_history)
                 session.flush()
                 logger.info(f"Image history saved for user: {image_data['user_id']}")
-                return image_history.id
+                return str(image_history.id)
                 
         except Exception as e:
             logger.error(f"Failed to save image history: {e}")
             raise DatabaseError(f"Failed to save image history: {e}")
 
-    async def get_image_history(self, user_id: str, page: int = 1, limit: int = 20) -> Dict[str, Any]:
-        """Get user's image generation history with pagination"""
+    async def get_image_history(
+        self, 
+        user_id: str, 
+        page: int = 1, 
+        limit: int = 20,
+        keyword: Optional[str] = None,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        model: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Get image history with filtering"""
         try:
             offset = (page - 1) * limit
             
             with self.get_session() as session:
-                # Get total count
-                total = session.query(ImageHistory).filter(
-                    ImageHistory.user_id == user_id
-                ).count()
+                query = session.query(ImageHistory).filter(ImageHistory.user_id == user_id)
                 
-                # Get paginated results
-                images = session.query(ImageHistory).filter(
-                    ImageHistory.user_id == user_id
-                ).order_by(ImageHistory.created_at.desc()).offset(offset).limit(limit).all()
+                # Filters
+                if keyword:
+                    query = query.filter(ImageHistory.prompt.ilike(f"%{keyword}%"))
+                
+                if start_date:
+                    query = query.filter(ImageHistory.created_at >= start_date)
+                    
+                if end_date:
+                    query = query.filter(ImageHistory.created_at <= end_date)
+                    
+                if model:
+                    # Filter by model in JSON metadata
+                    query = query.filter(
+                        cast(ImageHistory.generation_metadata['model'], String) == f'"{model}"'
+                    )
+
+                total = query.count()
+                
+                images = query.order_by(
+                    ImageHistory.created_at.desc()
+                ).offset(offset).limit(limit).all()
                 
                 return {
                     "images": [image.to_dict() for image in images],
                     "total": total,
                     "page": page,
                     "limit": limit,
-                    "total_pages": (total + limit - 1) // limit
+                    "total_pages": (total + limit - 1) // limit if limit > 0 else 0
                 }
                 
         except Exception as e:
             logger.error(f"Failed to get image history: {e}")
             raise DatabaseError(f"Failed to get image history: {e}")
-
+        
     async def get_image_by_id(self, image_id: str, user_id: str) -> Optional[Dict[str, Any]]:
         """Get specific image by ID"""
         try:
@@ -727,6 +784,57 @@ class Database:
         except Exception as e:
             logger.error(f"Failed to delete image history: {e}")
             raise DatabaseError(f"Failed to delete image history: {e}")
+        
+    async def update_search_history(self, search_id: str, user_id: str, update_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Update specific search history entry"""
+        try:
+            with self.get_session() as session:
+                search = session.query(SearchHistory).filter(
+                    SearchHistory.id == search_id,
+                    SearchHistory.user_id == user_id
+                ).first()
+                
+                if not search:
+                    return None
+                
+                # Update allowed fields
+                if "query" in update_data:
+                    search.query = update_data["query"]
+                
+                # If you map 'is_saved' or 'tags' later, add them here
+                # if "is_saved" in update_data:
+                #     search.is_saved = update_data["is_saved"]
+                
+                session.flush()
+                logger.info(f"Search history updated: {search_id}")
+                return search.to_dict()
+                
+        except Exception as e:
+            logger.error(f"Failed to update search history: {e}")
+            raise DatabaseError(f"Failed to update search history: {e}")
+
+    async def update_image_history(self, image_id: str, user_id: str, update_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Update specific image history entry"""
+        try:
+            with self.get_session() as session:
+                image = session.query(ImageHistory).filter(
+                    ImageHistory.id == image_id,
+                    ImageHistory.user_id == user_id
+                ).first()
+                
+                if not image:
+                    return None
+                
+                if "prompt" in update_data:
+                    image.prompt = update_data["prompt"]
+                
+                session.flush()
+                logger.info(f"Image history updated: {image_id}")
+                return image.to_dict()
+                
+        except Exception as e:
+            logger.error(f"Failed to update image history: {e}")
+            raise DatabaseError(f"Failed to update image history: {e}")    
 
 # Create database instance
 try:

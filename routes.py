@@ -1,7 +1,7 @@
 import os
 from fastapi import APIRouter, HTTPException, Depends, status, Query
 from pydantic import BaseModel, EmailStr, Field, validator
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta , date , time
 import random
 import string
 import json
@@ -19,7 +19,8 @@ from models import (
     MessageResponse, SearchRequest, SearchResult, SearchResponse,
     ImageGenRequest, ImageGenResponse, SearchHistoryResponse,
     ImageHistoryResponse, SearchHistoryItem, ImageHistoryItem,
-    DeleteResponse
+    DeleteResponse,
+    SearchHistoryUpdate, ImageHistoryUpdate
 )
 
 logger = logging.getLogger(__name__)
@@ -470,19 +471,32 @@ async def generate_image(
         logger.error(f"Image generation API error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Image generation error: {str(e)}")
 
-# Search History APIs
+
 @router.get("/search/history", response_model=SearchHistoryResponse)
 async def get_search_history(
     current_user: dict = Depends(get_current_user),
     page: int = Query(1, ge=1, description="Page number"),
-    limit: int = Query(20, ge=1, le=50, description="Items per page")
+    limit: int = Query(20, ge=1, le=50, description="Items per page"),
+    # New Filter Params
+    keyword: Optional[str] = Query(None, description="Search term keyword"),
+    start_date: Optional[date] = Query(None, description="Filter from date (YYYY-MM-DD)"),
+    end_date: Optional[date] = Query(None, description="Filter to date (YYYY-MM-DD)"),
+    search_engine: Optional[str] = Query(None, description="Filter by engine (DuckDuckGo, etc)")
 ):
-    """Get user's search history with pagination"""
+    """Get user's search history with filtering and pagination"""
     try:
+        # Convert date to datetime if provided for DB comparison
+        dt_start = datetime.combine(start_date, time.min) if start_date else None
+        dt_end = datetime.combine(end_date, time.max) if end_date else None
+
         history = await db.get_search_history(
             user_id=current_user["id"],
             page=page,
-            limit=limit
+            limit=limit,
+            keyword=keyword,
+            start_date=dt_start,
+            end_date=dt_end,
+            search_engine=search_engine
         )
         
         searches = [SearchHistoryItem(**search) for search in history["searches"]]
@@ -499,25 +513,32 @@ async def get_search_history(
         logger.error(f"Failed to get search history: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to get search history")
 
-@router.get("/search/history/{search_id}", response_model=SearchHistoryItem)
-async def get_search_by_id(
+@router.patch("/search/history/{search_id}", response_model=SearchHistoryItem)
+async def update_search_history(
     search_id: str,
+    update_data: SearchHistoryUpdate,
     current_user: dict = Depends(get_current_user)
 ):
-    """Get specific search result details"""
+    """Edit a specific search history entry"""
     try:
-        search = await db.get_search_by_id(search_id, current_user["id"])
+        # Filter out None values
+        data = {k: v for k, v in update_data.dict().items() if v is not None}
         
-        if not search:
+        if not data:
+            raise HTTPException(status_code=400, detail="No data provided for update")
+
+        updated_search = await db.update_search_history(search_id, current_user["id"], data)
+        
+        if not updated_search:
             raise HTTPException(status_code=404, detail="Search not found")
         
-        return SearchHistoryItem(**search)
+        return SearchHistoryItem(**updated_search)
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to get search by ID: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to get search")
+        logger.error(f"Failed to update search: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to update search")
 
 @router.delete("/search/history/{search_id}", response_model=DeleteResponse)
 async def delete_search_from_history(
@@ -536,26 +557,34 @@ async def delete_search_from_history(
             deleted=True,
             id=search_id
         )
-        
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Failed to delete search: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to delete search")
-
-# Image History APIs
+    
 @router.get("/image/history", response_model=ImageHistoryResponse)
 async def get_image_history(
     current_user: dict = Depends(get_current_user),
     page: int = Query(1, ge=1, description="Page number"),
-    limit: int = Query(20, ge=1, le=50, description="Items per page")
+    limit: int = Query(20, ge=1, le=50, description="Items per page"),
+    # New Filter Params
+    keyword: Optional[str] = Query(None, description="Prompt keyword"),
+    start_date: Optional[date] = Query(None, description="Filter from date (YYYY-MM-DD)"),
+    end_date: Optional[date] = Query(None, description="Filter to date (YYYY-MM-DD)"),
+    model: Optional[str] = Query(None, description="Filter by model (flux, etc)")
 ):
-    """Get user's generated images history with pagination"""
+    """Get user's generated images history with filtering and pagination"""
     try:
+        dt_start = datetime.combine(start_date, time.min) if start_date else None
+        dt_end = datetime.combine(end_date, time.max) if end_date else None
+
         history = await db.get_image_history(
             user_id=current_user["id"],
             page=page,
-            limit=limit
+            limit=limit,
+            keyword=keyword,
+            start_date=dt_start,
+            end_date=dt_end,
+            model=model
         )
         
         images = [ImageHistoryItem(**image) for image in history["images"]]
@@ -571,7 +600,7 @@ async def get_image_history(
     except Exception as e:
         logger.error(f"Failed to get image history: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to get image history")
-
+    
 @router.get("/image/history/{image_id}", response_model=ImageHistoryItem)
 async def get_image_by_id(
     image_id: str,
@@ -592,6 +621,32 @@ async def get_image_by_id(
         logger.error(f"Failed to get image by ID: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to get image")
 
+@router.patch("/image/history/{image_id}", response_model=ImageHistoryItem)
+async def update_image_history(
+    image_id: str,
+    update_data: ImageHistoryUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Edit a specific image history entry"""
+    try:
+        data = {k: v for k, v in update_data.dict().items() if v is not None}
+        
+        if not data:
+            raise HTTPException(status_code=400, detail="No data provided for update")
+
+        updated_image = await db.update_image_history(image_id, current_user["id"], data)
+        
+        if not updated_image:
+            raise HTTPException(status_code=404, detail="Image not found")
+        
+        return ImageHistoryItem(**updated_image)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update image: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to update image")
+
 @router.delete("/image/history/{image_id}", response_model=DeleteResponse)
 async def delete_image_from_history(
     image_id: str,
@@ -609,9 +664,6 @@ async def delete_image_from_history(
             deleted=True,
             id=image_id
         )
-        
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Failed to delete image: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to delete image")

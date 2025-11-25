@@ -147,6 +147,12 @@ class ImageGenResponse(BaseModel):
     provider: str
     error: Optional[str] = None
 
+class SearchHistoryUpdate(BaseModel):
+    query: Optional[str] = Field(None, min_length=1, max_length=500, description="Updated search query")
+
+class ImageHistoryUpdate(BaseModel):
+    prompt: Optional[str] = Field(None, min_length=1, max_length=1000, description="Updated image prompt")
+
 # History Models
 class SearchHistoryItem(BaseModel):
     id: str
@@ -184,3 +190,9 @@ class DeleteResponse(BaseModel):
     message: str
     deleted: bool
     id: str
+    
+class SearchHistoryUpdate(BaseModel):
+    query: Optional[str] = Field(None, min_length=1, max_length=500, description="Updated search query")
+
+class ImageHistoryUpdate(BaseModel):
+    prompt: Optional[str] = Field(None, min_length=1, max_length=1000, description="Updated image prompt")    
