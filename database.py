@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, Column, String, Boolean, DateTime, Text, JSON, Index
+from sqlalchemy import create_engine, Column, String, Boolean, DateTime, Text, JSON, Index, Integer
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
@@ -91,6 +91,56 @@ class ForgotPasswordOTP(Base):
     expires_at = Column(DateTime, nullable=False, index=True)
     is_used = Column(Boolean, default=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class SearchHistory(Base):
+    __tablename__ = "search_history"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, nullable=False, index=True)
+    query = Column(String, nullable=False)
+    results = Column(JSON)
+    total_results = Column(Integer, default=0)
+    search_engine = Column(String, default="DuckDuckGo")
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert search history object to dictionary"""
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "query": self.query,
+            "results": self.results,
+            "total_results": self.total_results,
+            "search_engine": self.search_engine,
+            "created_at": self.created_at.isoformat() if self.created_at else None
+        }
+
+class ImageHistory(Base):
+    __tablename__ = "image_history"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, nullable=False, index=True)
+    prompt = Column(Text, nullable=False)
+    image_url = Column(Text, nullable=False)
+    model = Column(String, default="flux")
+    width = Column(Integer, default=1024)
+    height = Column(Integer, default=1024)
+    provider = Column(String, default="Flux")
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert image history object to dictionary"""
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "prompt": self.prompt,
+            "image_url": self.image_url,
+            "model": self.model,
+            "width": self.width,
+            "height": self.height,
+            "provider": self.provider,
+            "created_at": self.created_at.isoformat() if self.created_at else None
+        }
 
 class DatabaseError(Exception):
     """Custom database exception"""
@@ -515,6 +565,168 @@ class Database:
         except Exception as e:
             logger.error(f"Failed to cleanup expired OTPs: {e}")
             return {"registration_otps": 0, "password_otps": 0}
+
+    # Search History operations
+    async def save_search_history(self, search_data: Dict[str, Any]) -> str:
+        """Save search to history"""
+        try:
+            with self.get_session() as session:
+                search_history = SearchHistory(
+                    user_id=search_data["user_id"],
+                    query=search_data["query"],
+                    results=search_data["results"],
+                    total_results=search_data.get("total_results", 0),
+                    search_engine=search_data.get("search_engine", "DuckDuckGo")
+                )
+                session.add(search_history)
+                session.flush()
+                logger.info(f"Search history saved for user: {search_data['user_id']}")
+                return search_history.id
+                
+        except Exception as e:
+            logger.error(f"Failed to save search history: {e}")
+            raise DatabaseError(f"Failed to save search history: {e}")
+
+    async def get_search_history(self, user_id: str, page: int = 1, limit: int = 20) -> Dict[str, Any]:
+        """Get user's search history with pagination"""
+        try:
+            offset = (page - 1) * limit
+            
+            with self.get_session() as session:
+                # Get total count
+                total = session.query(SearchHistory).filter(
+                    SearchHistory.user_id == user_id
+                ).count()
+                
+                # Get paginated results
+                searches = session.query(SearchHistory).filter(
+                    SearchHistory.user_id == user_id
+                ).order_by(SearchHistory.created_at.desc()).offset(offset).limit(limit).all()
+                
+                return {
+                    "searches": [search.to_dict() for search in searches],
+                    "total": total,
+                    "page": page,
+                    "limit": limit,
+                    "total_pages": (total + limit - 1) // limit
+                }
+                
+        except Exception as e:
+            logger.error(f"Failed to get search history: {e}")
+            raise DatabaseError(f"Failed to get search history: {e}")
+
+    async def get_search_by_id(self, search_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+        """Get specific search by ID"""
+        try:
+            with self.get_session() as session:
+                search = session.query(SearchHistory).filter(
+                    SearchHistory.id == search_id,
+                    SearchHistory.user_id == user_id
+                ).first()
+                
+                return search.to_dict() if search else None
+                
+        except Exception as e:
+            logger.error(f"Failed to get search by ID: {e}")
+            raise DatabaseError(f"Failed to get search by ID: {e}")
+
+    async def delete_search_history(self, search_id: str, user_id: str) -> bool:
+        """Delete specific search from history"""
+        try:
+            with self.get_session() as session:
+                result = session.query(SearchHistory).filter(
+                    SearchHistory.id == search_id,
+                    SearchHistory.user_id == user_id
+                ).delete()
+                
+                logger.info(f"Search history deleted: {search_id}")
+                return result > 0
+                
+        except Exception as e:
+            logger.error(f"Failed to delete search history: {e}")
+            raise DatabaseError(f"Failed to delete search history: {e}")
+
+    # Image History operations
+    async def save_image_history(self, image_data: Dict[str, Any]) -> str:
+        """Save generated image to history"""
+        try:
+            with self.get_session() as session:
+                image_history = ImageHistory(
+                    user_id=image_data["user_id"],
+                    prompt=image_data["prompt"],
+                    image_url=image_data["image_url"],
+                    model=image_data.get("model", "flux"),
+                    width=image_data.get("width", 1024),
+                    height=image_data.get("height", 1024),
+                    provider=image_data.get("provider", "Flux")
+                )
+                session.add(image_history)
+                session.flush()
+                logger.info(f"Image history saved for user: {image_data['user_id']}")
+                return image_history.id
+                
+        except Exception as e:
+            logger.error(f"Failed to save image history: {e}")
+            raise DatabaseError(f"Failed to save image history: {e}")
+
+    async def get_image_history(self, user_id: str, page: int = 1, limit: int = 20) -> Dict[str, Any]:
+        """Get user's image generation history with pagination"""
+        try:
+            offset = (page - 1) * limit
+            
+            with self.get_session() as session:
+                # Get total count
+                total = session.query(ImageHistory).filter(
+                    ImageHistory.user_id == user_id
+                ).count()
+                
+                # Get paginated results
+                images = session.query(ImageHistory).filter(
+                    ImageHistory.user_id == user_id
+                ).order_by(ImageHistory.created_at.desc()).offset(offset).limit(limit).all()
+                
+                return {
+                    "images": [image.to_dict() for image in images],
+                    "total": total,
+                    "page": page,
+                    "limit": limit,
+                    "total_pages": (total + limit - 1) // limit
+                }
+                
+        except Exception as e:
+            logger.error(f"Failed to get image history: {e}")
+            raise DatabaseError(f"Failed to get image history: {e}")
+
+    async def get_image_by_id(self, image_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+        """Get specific image by ID"""
+        try:
+            with self.get_session() as session:
+                image = session.query(ImageHistory).filter(
+                    ImageHistory.id == image_id,
+                    ImageHistory.user_id == user_id
+                ).first()
+                
+                return image.to_dict() if image else None
+                
+        except Exception as e:
+            logger.error(f"Failed to get image by ID: {e}")
+            raise DatabaseError(f"Failed to get image by ID: {e}")
+
+    async def delete_image_history(self, image_id: str, user_id: str) -> bool:
+        """Delete specific image from history"""
+        try:
+            with self.get_session() as session:
+                result = session.query(ImageHistory).filter(
+                    ImageHistory.id == image_id,
+                    ImageHistory.user_id == user_id
+                ).delete()
+                
+                logger.info(f"Image history deleted: {image_id}")
+                return result > 0
+                
+        except Exception as e:
+            logger.error(f"Failed to delete image history: {e}")
+            raise DatabaseError(f"Failed to delete image history: {e}")
 
 # Create database instance
 try:

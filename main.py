@@ -56,18 +56,8 @@ async def database_exception_handler(request, exc):
         content={"message": "Database operation failed", "success": False}
     )
 
-
 app.include_router(router)
 app.include_router(auth_router)
-
-@app.get("/")
-async def root():
-    """Root endpoint"""
-    return {
-        "message": "Assignment Backend API",
-        "status": "running",
-        "version": "1.0.0"
-    }
 
 # Health check endpoint
 @app.get("/health")

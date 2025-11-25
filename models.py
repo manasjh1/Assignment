@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, Field, validator
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 # Registration request (Moved from routes.py and added validators)
 class RegistrationRequest(BaseModel):
@@ -146,3 +146,41 @@ class ImageGenResponse(BaseModel):
     status: str
     provider: str
     error: Optional[str] = None
+
+# History Models
+class SearchHistoryItem(BaseModel):
+    id: str
+    query: str
+    results: List[Dict[str, Any]]
+    total_results: int
+    search_engine: str
+    created_at: str
+
+class SearchHistoryResponse(BaseModel):
+    searches: List[SearchHistoryItem]
+    total: int
+    page: int
+    limit: int
+    total_pages: int
+
+class ImageHistoryItem(BaseModel):
+    id: str
+    prompt: str
+    image_url: str
+    model: str
+    width: int
+    height: int
+    provider: str
+    created_at: str
+
+class ImageHistoryResponse(BaseModel):
+    images: List[ImageHistoryItem]
+    total: int
+    page: int
+    limit: int
+    total_pages: int
+
+class DeleteResponse(BaseModel):
+    message: str
+    deleted: bool
+    id: str

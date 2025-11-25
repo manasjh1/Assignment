@@ -1,5 +1,5 @@
 import os
-from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi import APIRouter, HTTPException, Depends, status, Query
 from pydantic import BaseModel, EmailStr, Field, validator
 from datetime import datetime, timedelta
 import random
@@ -17,7 +17,9 @@ from models import (
     RegistrationRequest, OTPVerificationRequest, LoginRequest, 
     ForgotPasswordRequest, ResetPasswordRequest, AuthResponse, 
     MessageResponse, SearchRequest, SearchResult, SearchResponse,
-    ImageGenRequest, ImageGenResponse
+    ImageGenRequest, ImageGenResponse, SearchHistoryResponse,
+    ImageHistoryResponse, SearchHistoryItem, ImageHistoryItem,
+    DeleteResponse
 )
 
 logger = logging.getLogger(__name__)
@@ -334,18 +336,6 @@ async def logout_user(
 async def get_current_user_info(current_user: dict = Depends(get_current_user)):
     """Get current user information"""
     return current_user
-
-@auth_router.get("/health")
-async def auth_health_check():
-    """Authentication service health check"""
-    try:
-        if db.check_connection():
-            return {"status": "healthy", "service": "authentication"}
-        else:
-            raise HTTPException(status_code=503, detail="Database connection failed")
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        raise HTTPException(status_code=503, detail="Service unavailable")
     
 @auth_router.post("/refresh", response_model=AuthResponse)
 async def refresh_token(
@@ -403,7 +393,7 @@ async def search_web(
     request: SearchRequest,
     current_user: dict = Depends(get_current_user)
 ):
-    """Search using DuckDuckGo MCP server - Protected endpoint"""
+    """Search using DuckDuckGo MCP server - Protected endpoint with auto-save"""
     try:
         logger.info(f"Search request from user {current_user.get('email')}: {request.query}")
         
@@ -413,6 +403,19 @@ async def search_web(
         )
         
         results = [SearchResult(**result) for result in search_result["results"]]
+        
+        # Auto-save successful search to history
+        if search_result["status"] == "success":
+            try:
+                await db.save_search_history({
+                    "user_id": current_user["id"],
+                    "query": request.query,
+                    "results": [result.dict() for result in results],
+                    "total_results": search_result["total_results"],
+                    "search_engine": search_result["search_engine"]
+                })
+            except Exception as save_error:
+                logger.warning(f"Failed to save search history: {save_error}")
         
         logger.info(f"Search completed for user {current_user.get('email')}: {len(results)} results")
         
@@ -430,66 +433,12 @@ async def search_web(
         logger.error(f"Search API error for user {current_user.get('email')}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Search error: {str(e)}")
 
-@router.post("/admin/search", response_model=SearchResponse)
-async def admin_search_web(
-    request: SearchRequest,
-    current_user: dict = Depends(get_current_user)
-):
-    """Admin search endpoint with elevated privileges"""
-    if current_user.get('role') != 'admin':
-        raise HTTPException(status_code=403, detail="Admin access required")
-    
-    try:
-        logger.info(f"Admin search request from {current_user.get('email')}: {request.query}")
-        
-        admin_max_results = min(request.max_results, 50)
-        
-        search_result = await search_service.search(
-            query=request.query,
-            max_results=admin_max_results
-        )
-        
-        results = [SearchResult(**result) for result in search_result["results"]]
-        
-        return SearchResponse(
-            results=results,
-            query=search_result["query"],
-            total_results=search_result["total_results"],
-            status=search_result["status"],
-            search_engine=search_result["search_engine"],
-            protocol=search_result["protocol"],
-            error=search_result.get("error")
-        )
-        
-    except Exception as e:
-        logger.error(f"Admin search error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Search error: {str(e)}")
-
-@router.get("/search/history")
-async def get_search_history(current_user: dict = Depends(get_current_user)):
-    """Get user's search history"""
-    return {
-        "message": "Search history feature coming soon",
-        "user_id": current_user.get('id'),
-        "searches": []
-    }
-
-@router.get("/test/protected")
-async def test_protected_endpoint(current_user: dict = Depends(get_current_user)):
-    """Test endpoint to verify authentication is working"""
-    return {
-        "message": "Authentication working!",
-        "user": current_user.get('email'),
-        "role": current_user.get('role'),
-        "user_id": current_user.get('id')
-    }
-
 @router.post("/image/generate", response_model=ImageGenResponse)
 async def generate_image(
     request: ImageGenRequest,
     current_user: dict = Depends(get_current_user)
 ):
-    """Generate image using Flux MCP - Protected endpoint"""
+    """Generate image using Flux MCP - Protected endpoint with auto-save"""
     try:
         logger.info(f"Image generation request from {current_user.get('email')}: {request.prompt}")
         
@@ -500,8 +449,169 @@ async def generate_image(
             height=request.height
         )
         
+        # Auto-save successful generation to history
+        if result["status"] == "success":
+            try:
+                await db.save_image_history({
+                    "user_id": current_user["id"],
+                    "prompt": request.prompt,
+                    "image_url": result["image_url"],
+                    "model": request.model,
+                    "width": request.width,
+                    "height": request.height,
+                    "provider": result["provider"]
+                })
+            except Exception as save_error:
+                logger.warning(f"Failed to save image history: {save_error}")
+        
         return ImageGenResponse(**result)
         
     except Exception as e:
         logger.error(f"Image generation API error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Image generation error: {str(e)}")
+
+# Search History APIs
+@router.get("/search/history", response_model=SearchHistoryResponse)
+async def get_search_history(
+    current_user: dict = Depends(get_current_user),
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=50, description="Items per page")
+):
+    """Get user's search history with pagination"""
+    try:
+        history = await db.get_search_history(
+            user_id=current_user["id"],
+            page=page,
+            limit=limit
+        )
+        
+        searches = [SearchHistoryItem(**search) for search in history["searches"]]
+        
+        return SearchHistoryResponse(
+            searches=searches,
+            total=history["total"],
+            page=history["page"],
+            limit=history["limit"],
+            total_pages=history["total_pages"]
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to get search history: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to get search history")
+
+@router.get("/search/history/{search_id}", response_model=SearchHistoryItem)
+async def get_search_by_id(
+    search_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get specific search result details"""
+    try:
+        search = await db.get_search_by_id(search_id, current_user["id"])
+        
+        if not search:
+            raise HTTPException(status_code=404, detail="Search not found")
+        
+        return SearchHistoryItem(**search)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get search by ID: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to get search")
+
+@router.delete("/search/history/{search_id}", response_model=DeleteResponse)
+async def delete_search_from_history(
+    search_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Delete a specific search from history"""
+    try:
+        deleted = await db.delete_search_history(search_id, current_user["id"])
+        
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Search not found")
+        
+        return DeleteResponse(
+            message="Search deleted successfully",
+            deleted=True,
+            id=search_id
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete search: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to delete search")
+
+# Image History APIs
+@router.get("/image/history", response_model=ImageHistoryResponse)
+async def get_image_history(
+    current_user: dict = Depends(get_current_user),
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(20, ge=1, le=50, description="Items per page")
+):
+    """Get user's generated images history with pagination"""
+    try:
+        history = await db.get_image_history(
+            user_id=current_user["id"],
+            page=page,
+            limit=limit
+        )
+        
+        images = [ImageHistoryItem(**image) for image in history["images"]]
+        
+        return ImageHistoryResponse(
+            images=images,
+            total=history["total"],
+            page=history["page"],
+            limit=history["limit"],
+            total_pages=history["total_pages"]
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to get image history: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to get image history")
+
+@router.get("/image/history/{image_id}", response_model=ImageHistoryItem)
+async def get_image_by_id(
+    image_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get specific image details"""
+    try:
+        image = await db.get_image_by_id(image_id, current_user["id"])
+        
+        if not image:
+            raise HTTPException(status_code=404, detail="Image not found")
+        
+        return ImageHistoryItem(**image)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get image by ID: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to get image")
+
+@router.delete("/image/history/{image_id}", response_model=DeleteResponse)
+async def delete_image_from_history(
+    image_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Delete a specific image from history"""
+    try:
+        deleted = await db.delete_image_history(image_id, current_user["id"])
+        
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Image not found")
+        
+        return DeleteResponse(
+            message="Image deleted successfully",
+            deleted=True,
+            id=image_id
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete image: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to delete image")
