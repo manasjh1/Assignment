@@ -3,7 +3,7 @@
 import logging
 import os
 import base64
-import json  # Added json import
+import json
 import httpx
 from typing import Dict, Any
 from urllib.parse import urlencode
@@ -69,6 +69,15 @@ class FluxImageGenService:
                             # FIX: Parse the JSON string to get the actual URL
                             try:
                                 data = json.loads(content_text)
+                                
+                                # --- ERROR CHECK ADDED HERE ---
+                                # Check if the API returned an error object instead of success
+                                if isinstance(data, dict) and ("error" in data or "message" in data):
+                                    # If it looks like an error response, raise exception to trigger fallback
+                                    error_msg = data.get("message") or data.get("error")
+                                    if error_msg and "server" in str(error_msg).lower():
+                                         raise Exception(f"MCP Server Error: {error_msg}")
+
                                 # Extract 'imageUrl' from the dictionary, default to raw text if missing
                                 final_url = data.get("imageUrl", content_text)
                             except json.JSONDecodeError:
@@ -81,7 +90,7 @@ class FluxImageGenService:
 
             except Exception as e:
                 logger.error(f"Flux MCP generation failed: {str(e)}")
-                # Proceed to fallback
+                # Proceed to fallback (The code continues below naturally)
 
         # 2. Fallback: Try Clipdrop API
         return await self._generate_with_clipdrop(prompt)
