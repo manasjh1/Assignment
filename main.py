@@ -96,6 +96,13 @@ async def startup_event():
 async def shutdown_event():
     """Application shutdown"""
     logger.info("Shutting down Assignment Backend API...")
+    
+@app.get("/")
+async def root():
+    return {
+        "message": "Assignment Backend API is running",
+        "docs_url": "/docs"
+    }
 
 if __name__ == "__main__":
     import uvicorn
