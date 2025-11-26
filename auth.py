@@ -31,24 +31,41 @@ class AuthManager:
         self.access_token_expire_minutes = 30 * 24 * 60  # 30 days
 
     def hash_password(self, password: str) -> str:
-        """Hash password using passlib bcrypt"""
+        """Hash password using direct bcrypt"""
         try:
-            return pwd_context.hash(password)
+            # Use direct bcrypt for most reliable hashing
+            password_bytes = password.encode('utf-8')
+            salt = bcrypt.gensalt()
+            hashed = bcrypt.hashpw(password_bytes, salt)
+            return hashed.decode('utf-8')
         except Exception as e:
-            logger.error(f"Password hashing failed: {e}")
-            raise HTTPException(status_code=500, detail="Password processing failed")
+            logger.error(f"Password hashing failed with bcrypt, trying passlib: {e}")
+            try:
+                return pwd_context.hash(password)
+            except Exception as e2:
+                logger.error(f"Password hashing failed: {e2}")
+                raise HTTPException(status_code=500, detail="Password processing failed")
 
     def verify_password(self, plain_password: str, hashed_password: str) -> bool:
-        """Verify password against hash with multiple fallbacks"""
+        """Verify password against hash with direct bcrypt as primary"""
         try:
-            # Primary method: passlib
-            return pwd_context.verify(plain_password, hashed_password)
+            # Method 1: Direct bcrypt (most reliable in production)
+            if isinstance(hashed_password, str):
+                hashed_password = hashed_password.encode('utf-8')
+            if isinstance(plain_password, str):
+                plain_password = plain_password.encode('utf-8')
+            
+            result = bcrypt.checkpw(plain_password, hashed_password)
+            logger.info(f"Direct bcrypt verification result: {result}")
+            return result
         except Exception as e:
-            logger.warning(f"Passlib verification failed, trying bcrypt direct: {e}")
+            logger.warning(f"Direct bcrypt failed, trying passlib: {e}")
             try:
-                # Fallback: direct bcrypt
-                import bcrypt
-                return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+                # Method 2: Passlib fallback
+                result = pwd_context.verify(plain_password.decode('utf-8') if isinstance(plain_password, bytes) else plain_password, 
+                                          hashed_password.decode('utf-8') if isinstance(hashed_password, bytes) else hashed_password)
+                logger.info(f"Passlib verification result: {result}")
+                return result
             except Exception as e2:
                 logger.error(f"All password verification methods failed: {e2}")
                 return False
@@ -105,8 +122,11 @@ class AuthManager:
                 logger.warning(f"User account disabled: {normalized_email}")
                 return None
 
-            # Verify password
-            if self.verify_password(password, user['password_hash']):
+            # Verify password with enhanced logging
+            logger.info(f"Attempting password verification for user: {normalized_email}")
+            password_valid = self.verify_password(password, user['password_hash'])
+            
+            if password_valid:
                 # Remove sensitive data
                 user_safe = user.copy()
                 user_safe.pop('password_hash', None)
