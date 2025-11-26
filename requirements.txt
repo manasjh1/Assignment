@@ -1,17 +1,14 @@
-# Let pip resolve compatible versions automatically
 duckduckgo-mcp-server
 mcp
 beautifulsoup4
 httpx
-
-# Your core FastAPI app
 sqlalchemy>=1.4.0,<2.0.0
 psycopg2-binary>=2.9.0
 fastapi
 uvicorn[standard]
-bcrypt
 python-jose[cryptography]
 passlib[bcrypt]
 pydantic[email]
 python-dotenv
 python-dateutil
+bcrypt==3.2.2
